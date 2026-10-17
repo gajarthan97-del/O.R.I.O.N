@@ -1,6 +1,8 @@
 """ORION Voice: cross-platform localhost client for hosted Groq + Gemini APIs."""
 import asyncio
 import base64
+import logging
+from contextlib import asynccontextmanager
 import json
 import re
 import os
@@ -19,7 +21,14 @@ BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 DB = BASE / "data" / "orion.sqlite3"
 DB.parent.mkdir(exist_ok=True)
-app = FastAPI(docs_url=None, redoc_url=None)
+log = logging.getLogger("orion")
+
+@asynccontextmanager
+async def lifespan(_app):
+    preload_local_models()
+    yield
+
+app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "testserver"])
 with sqlite3.connect(DB) as db:
     db.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, session TEXT, role TEXT, content TEXT, agent TEXT)")
@@ -71,8 +80,7 @@ async def upstream(method, url, **kwargs):
 async def root():
     return FileResponse(BASE / "static" / "index.html")
 
-@app.on_event("startup")
-async def preload_local_models():
+def preload_local_models():
     """Load local speech models in the background so the first voice turn isn't a 30s+ wait."""
     if "local" not in (os.getenv("STT_PROVIDER","local"), os.getenv("TTS_PROVIDER","local")):
         return
@@ -83,7 +91,7 @@ async def preload_local_models():
             local_ai.synthesize("Ready.")
             local_ai.synthesize("தயார்.")
         except Exception:
-            pass
+            log.warning("Local model preload failed", exc_info=True)
     asyncio.get_running_loop().run_in_executor(None, warm)
 
 @app.get("/api/health")
@@ -125,23 +133,22 @@ async def chat_stream(turn: Turn):
     async def events():
         answer = ""
         try:
-            if True:
-                async with HTTP.stream("POST","https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization":"Bearer "+key},
-                    json={"model":os.getenv("GROQ_MODEL","qwen/qwen3.8-27b"),"messages":messages,"temperature":0.5,"stream":True}) as r:
-                    if r.status_code >= 400:
-                        yield "data: "+json.dumps({"error":f"AI provider returned HTTP {r.status_code}"})+"\n\n"
-                        return
-                    async for line in r.aiter_lines():
-                        if not line.startswith("data:") or line.strip() == "data: [DONE]":
-                            continue
-                        try:
-                            delta = json.loads(line[5:])["choices"][0]["delta"].get("content") or ""
-                        except (ValueError, KeyError, IndexError, TypeError):
-                            continue
-                        if delta:
-                            answer += delta
-                            yield "data: "+json.dumps({"d":delta})+"\n\n"
+            async with HTTP.stream("POST","https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization":"Bearer "+key},
+                json={"model":os.getenv("GROQ_MODEL","qwen/qwen3.8-27b"),"messages":messages,"temperature":0.5,"stream":True}) as r:
+                if r.status_code >= 400:
+                    yield "data: "+json.dumps({"error":f"AI provider returned HTTP {r.status_code}"})+"\n\n"
+                    return
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:") or line.strip() == "data: [DONE]":
+                        continue
+                    try:
+                        delta = json.loads(line[5:])["choices"][0]["delta"].get("content") or ""
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        continue
+                    if delta:
+                        answer += delta
+                        yield "data: "+json.dumps({"d":delta})+"\n\n"
         except httpx.HTTPError:
             yield "data: "+json.dumps({"error":"AI provider connection error"})+"\n\n"
         finally:
@@ -174,6 +181,7 @@ async def transcribe(file: UploadFile = File(...)):
             import local_ai
             return {"text":await asyncio.to_thread(local_ai.transcribe, audio)}
         except Exception:
+            log.warning("Local transcription failed; falling back to Groq", exc_info=True)
             if not os.getenv("GROQ_API_KEY"):
                 raise HTTPException(502,detail="Local transcription failed")
     result = await upstream("POST","https://api.groq.com/openai/v1/audio/transcriptions",
@@ -202,11 +210,13 @@ async def tts(turn: Turn):
             import local_ai
             return Response(await asyncio.to_thread(local_ai.synthesize, turn.text[:3000]), media_type="audio/wav")
         except Exception:
+            log.warning("Local TTS failed; falling back to Edge", exc_info=True)
             provider = "edge"
     if provider == "edge":
         try:
             return Response(await edge_tts_audio(turn.text), media_type="audio/mpeg")
         except Exception:
+            log.warning("Edge TTS failed; falling back to Gemini", exc_info=True)
             if not os.getenv("GEMINI_API_KEY"):
                 raise HTTPException(502, detail="Edge TTS unavailable")
     return await gemini_tts(turn)
