@@ -3,9 +3,9 @@
 <header><h1>◉ O.R.I.O.N.</h1><span>Voice-first AI</span></header><p>Hosted Groq + Gemini · Tamil / English / Tanglish</p>
 <div class="controls"><label for="agent">Agent</label><select id="agent"></select><button id="new">New conversation</button></div>
 <main id="log" aria-live="polite"></main><p id="state" role="status">Ready</p>
-<div class="controls"><button id="record">🎙 Start recording</button><button id="stop" disabled>■ Stop</button><label><input id="speak" type="checkbox" checked> Speak replies</label></div>
+<div class="controls"><button id="call">📞 Start live call</button><button id="record">🎙 Start recording</button><button id="stop" disabled>■ Stop</button><label><input id="speak" type="checkbox" checked> Speak replies</label><label><input id="wake" type="checkbox"> Wake word: &ldquo;Hey ORION&rdquo; / &ldquo;ORION&rdquo;</label></div>
 <form id="chat" class="controls"><input id="prompt" placeholder="Ask ORION in Tamil or English…" required maxlength="8000"><button id="send">Send</button></form>
-<p class="note">Microphone audio and messages are sent to cloud AI providers. Chat history is stored on this machine. API keys stay on the Python backend. Do not expose this app to the public Internet.</p>
+<p class="note">Wake-word listening uses your browser's built-in speech recognition (Chrome/Edge), which may send audio to the browser vendor. Microphone audio and messages are sent to cloud AI providers. Chat history is stored on this machine. API keys stay on the Python backend. Do not expose this app to the public Internet.</p>
 <script>
 const $=x=>document.getElementById(x);let session=sessionStorage.getItem("orion_session")||crypto.randomUUID().replace(/-/g,"");sessionStorage.setItem("orion_session",session);
 let recorder,chunks=[],stream;
@@ -13,10 +13,55 @@ async function request(url,options){const r=await fetch(url,options);if(!r.ok){l
 const state=x=>$("state").textContent=x;
 function add(role,content){const d=document.createElement("div");d.className="msg "+role;d.textContent=(role==="user"?"YOU: ":"ORION: ")+content;$("log").append(d);$("log").scrollTop=$("log").scrollHeight}
 async function chat(text){state("Thinking…");$("send").disabled=true;try{add("user",text);const r=await request("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,agent:$("agent").value,session})});const d=await r.json();add("assistant",d.answer);state("Ready");if($("speak").checked)await speak(d.answer)}catch(e){state("Error: "+e.message)}finally{$("send").disabled=false}}
-async function speak(text){try{state("Generating voice…");const r=await request("/api/tts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,agent:$("agent").value,session})});const blob=await r.blob();const url=URL.createObjectURL(blob);const a=new Audio(url);a.onended=()=>URL.revokeObjectURL(url);await a.play();state("Ready")}catch(e){state("Speech unavailable: "+e.message)}}
+async function speak(text){try{state("Generating voice…");const r=await request("/api/tts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,agent:$("agent").value,session})});const blob=await r.blob();const url=URL.createObjectURL(blob);const a=new Audio(url);await new Promise((res,rej)=>{a.onended=res;a.onerror=rej;a.play().catch(rej)});URL.revokeObjectURL(url);state("Ready")}catch(e){await browserSpeak(text);state("Ready (browser voice: "+e.message+")")}}
 $("chat").onsubmit=e=>{e.preventDefault();const t=$("prompt").value.trim();if(t){$("prompt").value="";chat(t)}};
 $("new").onclick=()=>{session=crypto.randomUUID().replace(/-/g,"");sessionStorage.setItem("orion_session",session);$("log").replaceChildren();state("New conversation")};
 $("record").onclick=async()=>{try{stream=await navigator.mediaDevices.getUserMedia({audio:true});const mime=["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(t=>MediaRecorder.isTypeSupported(t));recorder=new MediaRecorder(stream,mime?{mimeType:mime}:{});chunks=[];recorder.ondataavailable=e=>chunks.push(e.data);recorder.onstop=async()=>{stream.getTracks().forEach(t=>t.stop());state("Transcribing…");try{const ext=recorder.mimeType.includes("mp4")?"mp4":"webm";const fd=new FormData();fd.append("file",new Blob(chunks,{type:recorder.mimeType}),"speech."+ext);const r=await request("/api/transcribe",{method:"POST",body:fd});const t=(await r.json()).text;if(t)await chat(t);else state("No speech detected")}catch(e){state("Transcription error: "+e.message)}};recorder.start();$("record").disabled=true;$("stop").disabled=false;state("Recording…")}catch(e){state("Microphone unavailable: "+e.message)}};
 $("stop").onclick=()=>{if(recorder?.state==="recording")recorder.stop();$("record").disabled=false;$("stop").disabled=true};
 (async()=>{try{const h=await(await request("/api/health")).json();for(const a of h.agents){const o=document.createElement("option");o.value=a;o.textContent=a.toUpperCase();$("agent").append(o)}const hist=await(await request("/api/history/"+session)).json();hist.messages.forEach(m=>add(m.role,m.content));if(!h.groq_configured||!h.gemini_configured)state("Configure GROQ_API_KEY and GEMINI_API_KEY in .env")}catch(e){state(e.message)}})();
+
+// ---- Wake word: "Hey ORION" / "ORION" ----
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;let rec=null,busy=false;
+const WAKE=/\b(?:hey|hi|ok|okay)?\s*(?:orion|o\.r\.i\.o\.n\.?|orian|oryan|ryan)\b[\s,.:!?-]*/i;
+function listen(){if(!SR||!$("wake").checked||busy||rec)return;rec=new SR();rec.continuous=true;rec.interimResults=false;rec.lang="en-US";
+rec.onresult=e=>{const t=e.results[e.results.length-1][0].transcript;const m=t.match(WAKE);if(!m)return;const rest=t.slice(m.index+m[0].length).trim();stopListen();handle(rest)};
+rec.onerror=e=>{if(e.error==="not-allowed"||e.error==="service-not-allowed"){$("wake").checked=false;localStorage.setItem("orion_wake","0");state("Wake word needs microphone permission")}};
+rec.onend=()=>{rec=null;if($("wake").checked&&!busy)setTimeout(listen,300)};
+try{rec.start();state("Listening for “Hey ORION”…")}catch{rec=null}}
+function stopListen(){if(rec){const r=rec;rec=null;r.onend=null;try{r.stop()}catch{}}}
+async function handle(rest){busy=true;try{if(rest.split(/\s+/).filter(Boolean).length>=2){await chat(rest)}else{const blob=await recordUntilSilence();if(blob){state("Transcribing…");const fd=new FormData();fd.append("file",blob,"speech."+(blob.type.includes("mp4")?"mp4":"webm"));const t=(await(await request("/api/transcribe",{method:"POST",body:fd})).json()).text;if(t)await chat(t);else state("No speech detected")}}}catch(e){state("Error: "+e.message)}finally{busy=false;listen()}}
+async function recordUntilSilence(){const st=await navigator.mediaDevices.getUserMedia({audio:true});const mime=["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(t=>MediaRecorder.isTypeSupported(t));const mr=new MediaRecorder(st,mime?{mimeType:mime}:{});const ch=[];mr.ondataavailable=e=>ch.push(e.data);
+const ctx=new AudioContext(),an=ctx.createAnalyser();an.fftSize=1024;ctx.createMediaStreamSource(st).connect(an);const buf=new Uint8Array(an.fftSize);
+state("Yes? I'm listening…");mr.start();const t0=Date.now();let heard=false,quiet=Date.now();
+await new Promise(res=>{const tick=setInterval(()=>{an.getByteTimeDomainData(buf);let pk=0;for(const v of buf)pk=Math.max(pk,Math.abs(v-128));const now=Date.now();if(pk>12){heard=true;quiet=now}
+if((heard&&now-quiet>1400)||(!heard&&now-t0>6000)||now-t0>30000){clearInterval(tick);res()}},100)});
+await new Promise(res=>{mr.onstop=res;mr.stop()});st.getTracks().forEach(t=>t.stop());ctx.close();return heard?new Blob(ch,{type:mr.mimeType}):null}
+$("wake").onchange=()=>{localStorage.setItem("orion_wake",$("wake").checked?"1":"0");if($("wake").checked){if(!SR){$("wake").checked=false;state("Wake word needs Chrome or Edge");return}listen()}else{stopListen();state("Ready")}};
+if(localStorage.getItem("orion_wake")==="1"&&SR){$("wake").checked=true;listen()}
+
+// ---- Live call: continuous VAD, streamed replies, sentence-by-sentence voice, barge-in ----
+let live=false,cStream,cCtx,cTimer,mr2=null,cChunks=[],turnId=0,ctl=null,voiceMs=0,uStart=0,lastVoice=0;
+const player={q:[],cur:null,wake:null,running:false};
+const talking=()=>player.running||player.q.length>0;
+function browserSpeak(t){return new Promise(res=>{if(!window.speechSynthesis)return res();const u=new SpeechSynthesisUtterance(t);if(/[஀-௿]/.test(t))u.lang="ta-IN";player.wake=res;u.onend=u.onerror=()=>res();state("Speaking… (talk to interrupt)");speechSynthesis.speak(u)})}
+function stopPlayback(){player.q=[];if(window.speechSynthesis)speechSynthesis.cancel();if(player.cur){player.cur.pause();player.wake&&player.wake()}}
+function interrupt(){turnId++;if(ctl)ctl.abort();ctl=null;stopPlayback()}
+async function runPlayer(){if(player.running)return;player.running=true;try{while(player.q.length){const it=player.q.shift();let blob;try{blob=await it.p}catch{if(live&&it.id===turnId)await browserSpeak(it.text);continue}if(!live||it.id!==turnId)continue;const url=URL.createObjectURL(blob);const a=new Audio(url);player.cur=a;state("Speaking… (talk to interrupt)");await new Promise(res=>{player.wake=res;a.onended=res;a.onerror=res;a.play().catch(res)});URL.revokeObjectURL(url);player.cur=null}}finally{player.running=false;if(live&&!mr2)state("Live call — listening…")}}
+function enqueueSpeech(text,id){if(!$("speak").checked||!text.trim())return;const p=request("/api/tts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text,agent:$("agent").value,session})}).then(r=>r.blob());p.catch(()=>{});player.q.push({p,id,text});runPlayer()}
+async function liveTurn(blob){const id=++turnId;try{state("Transcribing…");const fd=new FormData();fd.append("file",blob,"speech."+(blob.type.includes("mp4")?"mp4":"webm"));const text=(await(await request("/api/transcribe",{method:"POST",body:fd})).json()).text?.trim();if(id!==turnId)return;if(!text||text.length<2){state("Live call — listening…");return}
+add("user",text);state("Thinking…");ctl=new AbortController();const r=await request("/api/chat/stream",{method:"POST",signal:ctl.signal,headers:{"Content-Type":"application/json"},body:JSON.stringify({text,agent:$("agent").value,session})});
+const div=document.createElement("div");div.className="msg assistant";div.textContent="ORION: ";$("log").append(div);const rd=r.body.getReader(),dec=new TextDecoder();let buf="",pend="",full="",spoke=0;
+const flush=(final)=>{if(!spoke&&!final){const c=pend.match(/^([\s\S]{20,}?[,;:])\s/);if(c){spoke=1;enqueueSpeech(c[1].trim(),id);pend=pend.slice(c[0].length)}}let m;while((m=pend.match(/^([\s\S]*?[.!?…।]+["')\]]*)(\s+|$)/))&&(final||m[0].length<pend.length||/\s$/.test(m[0]))){const sent=m[1].trim();pend=pend.slice(m[0].length);if(sent)enqueueSpeech(sent,id);if(!pend)break}if(final&&pend.trim()){enqueueSpeech(pend.trim(),id);pend=""}};
+for(;;){const {done,value}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});let i;while((i=buf.indexOf("\n\n"))>=0){const ev=buf.slice(0,i);buf=buf.slice(i+2);if(!ev.startsWith("data:"))continue;const j=JSON.parse(ev.slice(5));if(j.error)throw Error(j.error);if(id!==turnId)return;full+=j.d;pend+=j.d;div.textContent="ORION: "+full;$("log").scrollTop=$("log").scrollHeight;flush(false)}}
+if(id===turnId){flush(true);if(!talking())state("Live call — listening…")}}catch(e){if(e.name!=="AbortError")state("Error: "+e.message)}}
+function beginUtt(){const mime=["audio/webm;codecs=opus","audio/webm","audio/mp4"].find(t=>MediaRecorder.isTypeSupported(t));mr2=new MediaRecorder(cStream,mime?{mimeType:mime}:{});cChunks=[];mr2.ondataavailable=e=>cChunks.push(e.data);mr2.start();uStart=lastVoice=Date.now();if(!talking())state("Listening…")}
+function endUtt(){const r=mr2;mr2=null;voiceMs=0;const dur=lastVoice-uStart;r.onstop=()=>{if(live&&dur>350)liveTurn(new Blob(cChunks,{type:r.mimeType}));else if(live&&!talking())state("Live call — listening…")};r.stop()}
+async function startCall(){try{cStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}catch(e){state("Microphone unavailable: "+e.message);return}
+busy=true;stopListen();live=true;$("call").textContent="📵 End call";$("record").disabled=true;cCtx=new AudioContext();const an=cCtx.createAnalyser();an.fftSize=1024;cCtx.createMediaStreamSource(cStream).connect(an);const buf=new Uint8Array(an.fftSize);state("Live call — listening…");
+cTimer=setInterval(()=>{an.getByteTimeDomainData(buf);let pk=0;for(const v of buf)pk=Math.max(pk,Math.abs(v-128));const now=Date.now(),sp=talking(),thr=sp?32:14,voice=pk>thr;
+if(voice){voiceMs+=50;lastVoice=now}else if(!mr2)voiceMs=0;
+if(!mr2&&voiceMs>=(sp?300:100)){if(sp||ctl)interrupt();beginUtt()}
+else if(mr2&&(now-lastVoice>800||now-uStart>30000))endUtt()},50)}
+function endCall(){live=false;clearInterval(cTimer);interrupt();if(mr2){mr2.onstop=null;try{mr2.stop()}catch{}mr2=null}cStream?.getTracks().forEach(t=>t.stop());cCtx?.close();$("call").textContent="📞 Start live call";$("record").disabled=false;busy=false;state("Call ended");listen()}
+$("call").onclick=()=>live?endCall():startCall();
 </script></body></html>

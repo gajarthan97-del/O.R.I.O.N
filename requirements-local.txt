@@ -1,0 +1,11 @@
+# Optional: fully local speech-to-text and text-to-speech (NVIDIA GPU optional; CPU works, slower)
+-r requirements.txt
+faster-whisper>=1.1,<2
+kokoro-onnx>=0.4,<1
+soundfile
+numpy
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+transformers>=4.40
